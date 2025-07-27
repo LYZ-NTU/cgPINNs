@@ -1,0 +1,238 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_bvp
+import sys
+import re
+
+import deepxde as dde
+from deepxde.backend import tf
+
+
+l = 0.01
+h=0.0001
+ec=20000
+
+
+def k(x):
+    return 0.1 + np.exp(-0.5 * (x - 0.5) ** 2 / 0.15 ** 2)
+def fun(x, y):
+    return np.vstack((y[1], 100 * (k(x) * y[0] + np.sin(2 * np.pi * x))))
+
+def bc(ya, yb):
+    return np.array([ya[0], yb[0]])
+
+
+a = np.linspace(0, 1, 1000)
+b = np.zeros((2, a.size))
+
+res = solve_bvp(fun, bc, a, b)
+
+
+def sol(x):
+    return res.sol(x)[0]
+
+
+def du(x):
+    return res.sol(x)[1]
+
+
+# PINN
+def gen_traindata(num):
+    xvals = np.linspace(0, 1, num)
+    yvals = sol(xvals)
+    return np.reshape(xvals, (-1, 1)), np.reshape(yvals, (-1, 1))
+
+def output_transform(x, y):
+    return tf.concat(
+        (tf.math.tanh(x) * tf.math.tanh(1 - x) * y[:, 0:1], y[:, 1:2]), axis=1
+    )
+
+geom = dde.geometry.Interval(0, 1)
+ob_x, ob_u = gen_traindata(8)
+observe_u = dde.PointSetBC(ob_x, ob_u, component=0)
+bc = dde.DirichletBC(geom, sol, lambda _, on_boundary: on_boundary, component=0)
+
+
+def PINNpde(x, y):
+    u = y[:, 0:1]
+    k = y[:, 1:2]
+    du_xx = dde.grad.hessian(y, x, component=0)
+    return l * du_xx - k * u - tf.sin(2 * np.pi * x)
+
+
+data = dde.data.PDE(
+    geom,
+    PINNpde,
+    bcs=[bc, observe_u],
+    num_domain=8,
+    num_boundary=2,
+    train_distribution="uniform",
+    num_test=1000,
+)
+net = dde.maps.PFNN([1, [20, 20], [20, 20], [20, 20], 2], "tanh", "Glorot uniform")
+PINNmodel = dde.Model(data, net)
+PINNmodel.compile("adam", lr=0.0001, metrics=[])
+losshistory, train_state = PINNmodel.train(epochs=ec, callbacks=[])
+dde.saveplot(losshistory, train_state, issave=False, isplot=False)
+
+# gPINN
+def gen_traindata(num):
+    xvals = np.linspace(0, 1, num)
+    yvals = sol(xvals)
+    return np.reshape(xvals, (-1, 1)), np.reshape(yvals, (-1, 1))
+
+# def output_transform(x, y):
+#     return tf.concat((x * (1 - x) * y[:, 0:1], y[:, 1:2]), axis=1)
+
+geom = dde.geometry.Interval(0, 1)
+
+ob_x, ob_u = gen_traindata(8)
+observe_u = dde.PointSetBC(ob_x, ob_u, component=0)
+bc = dde.DirichletBC(geom, sol, lambda _, on_boundary: on_boundary, component=0)
+
+
+def gPINNpde(x, y):
+    u = y[:, 0:1]
+    k = y[:, 1:2]
+    du_x = dde.grad.jacobian(y, x, i=0)
+    du_xx = dde.grad.hessian(y, x, component=0)
+    du_xxx = dde.grad.jacobian(du_xx, x)
+    dk_x = dde.grad.jacobian(y, x, i=1)
+    return [
+        l * du_xx - k * u - tf.sin(2 * np.pi * x),
+        l * du_xxx - k * du_x - u * dk_x - 2 * np.pi * tf.cos(2 * np.pi * x),
+    ]
+
+
+data = dde.data.PDE(
+    geom,
+    gPINNpde,
+    bcs=[bc, observe_u],
+    num_domain=8,
+    num_boundary=2,
+    train_distribution="uniform",
+    num_test=1000,
+)
+net = dde.maps.PFNN([1, [20, 20], [20, 20], [20, 20], 2], "tanh", "Glorot uniform")
+gPINNmodel = dde.Model(data, net)
+gPINNmodel.compile("adam", lr=0.0001, metrics=[], loss_weights=[1, 0.01,1,1])
+losshistory, train_state = gPINNmodel.train(epochs=ec, callbacks=[])
+dde.saveplot(losshistory, train_state, issave=False, isplot=False)
+
+
+#中心差分
+def gen_traindata(num):
+    xvals = np.linspace(0, 1, num)
+    yvals = sol(xvals)
+    return np.reshape(xvals, (-1, 1)), np.reshape(yvals, (-1, 1))
+
+
+# def output_transform(x, y):
+#     return tf.concat((x * (1 - x) * y[:, 0:1], y[:, 1:2]), axis=1)
+
+geom = dde.geometry.Interval(0, 1)
+ob_x, ob_u = gen_traindata(8)
+observe_u = dde.PointSetBC(ob_x, ob_u, component=0)
+bc = dde.DirichletBC(geom, sol, lambda _, on_boundary: on_boundary, component=0)
+
+
+def cgPINNpde(x, y):
+    u = y[:, 0:1]
+    k = y[:, 1:2]
+
+    du_x = dde.grad.jacobian(y, x, i=0)
+    du_xx = dde.grad.hessian(y, x, component=0)
+    du_xxx = dde.grad.jacobian(du_xx, x)
+    # dk_x = dde.grad.jacobian(y, x, i=1)
+    dk_cx=(
+        (0.1 + tf.exp(-0.5 * ((x+h) - 0.5) ** 2 / 0.15 ** 2))-
+        (0.1 + tf.exp(-0.5 * ((x-h) - 0.5) ** 2 / 0.15 ** 2))
+    )/2/h
+    df_cx=(tf.sin(2*np.pi*(x+h))-tf.sin(2*np.pi*(x-h)))/2/h
+    return [
+        l * du_xx - k * u - tf.sin(2 * np.pi * x),
+        l * du_xxx - k * du_x - u * dk_cx - df_cx,
+    ]
+
+
+data = dde.data.PDE(
+    geom,
+    cgPINNpde,
+    bcs=[bc, observe_u],
+    num_domain=8,
+    num_boundary=2,
+    train_distribution="uniform",
+    num_test=1000,
+)
+net = dde.maps.PFNN([1, [20, 20], [20, 20], [20, 20], 2], "tanh", "Glorot uniform")
+cgPINNmodel = dde.Model(data, net)
+cgPINNmodel.compile("adam", lr=0.0001, metrics=[], loss_weights=[1, 0.01,1,1])
+losshistory, train_state = cgPINNmodel.train(epochs=ec, callbacks=[])
+dde.saveplot(losshistory, train_state, issave=False, isplot=False)
+
+
+
+# plots
+x = geom.uniform_points(100)
+plt.rcParams.update({"font.size": 15})
+plt.figure(figsize=(10,6))
+plt.plot(x, sol(x), label="Exact", color="black")
+plt.plot(x, PINNmodel.predict(x)[:, 0], label="PINN", linestyle="dashed", color="green")
+plt.plot(x, gPINNmodel.predict(x)[:, 0], label="gPINN", linestyle="dashed", color="blue")
+plt.plot(x, cgPINNmodel.predict(x)[:, 0], label="cgPINN", linestyle="dashed", color="red")
+
+x = geom.uniform_points(8)
+plt.plot(x, sol(x), label="Observed", color="black", marker="s", linestyle="none")
+plt.legend(frameon=False)
+plt.ylabel("u")
+plt.xlabel("x")
+# plt.savefig('F21.png' , bbox_inches='tight',pad_inches=0.03)
+plt.show()
+x = geom.uniform_points(100)
+
+plt.rcParams.update({"font.size": 20})
+plt.figure(figsize=(10,6))
+
+plt.plot(x, k(x), label="Exact", color="black")
+plt.plot(x, PINNmodel.predict(x)[:, 1], label="PINN", linestyle="dashed", color="green")
+plt.plot(x, gPINNmodel.predict(x)[:, 1], label="gPINN", linestyle="dashed", color="blue")
+plt.plot(x, cgPINNmodel.predict(x)[:, 1], label="cgPINN", linestyle="dashed", color="red")
+plt.legend(frameon=False)
+plt.ylabel("K")
+plt.xlabel("x")
+# plt.savefig('F22.png' , bbox_inches='tight',pad_inches=0.02)
+plt.show()
+
+plt.rcParams.update({"font.size": 15})
+plt.figure(figsize=(10,6))
+plt.plot(x, du(x), label="Exact", color="black")
+plt.plot(
+    x,
+    PINNmodel.predict(x, operator=lambda x, y: dde.grad.jacobian(y, x)),
+    label="PINN",
+    linestyle="dashed",
+    color="green",
+)
+plt.plot(
+    x,
+    gPINNmodel.predict(x, operator=lambda x, y: dde.grad.jacobian(y, x)),
+    label="gPINN",
+    linestyle="dashed",
+    color="blue",
+)
+plt.plot(
+    x,
+    cgPINNmodel.predict(x, operator=lambda x, y: dde.grad.jacobian(y, x)),
+    label="cgPINN",
+    linestyle="dashed",
+    color="red",
+)
+plt.legend(frameon=False)
+plt.ylabel("u'")
+plt.xlabel("x")
+# plt.savefig('F23.png' , bbox_inches='tight',pad_inches=0.02)
+plt.show()
